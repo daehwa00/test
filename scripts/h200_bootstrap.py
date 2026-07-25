@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ RUNTIME_NAME = "time-h200-qlab"
 READY_MARKER = "READY.json"
 FINGERPRINT_SCHEMA = 1
 PYTORCH_CU124_INDEX = "https://download.pytorch.org/whl/cu124"
+VIRTUALENV_VERSION = "20.31.2"
 
 # This is intentionally the single source of the scientific runtime contract.
 QLAB_PINS = {
@@ -37,9 +39,50 @@ QLAB_PINS = {
 }
 
 
+def bootstrap_tool_path(cache_root: Path) -> Path:
+    return cache_root / "bootstrap" / f"virtualenv-{VIRTUALENV_VERSION}"
+
+
+def bootstrap_tool_command(cache_root: Path, pip_cache: Path) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--target",
+        str(bootstrap_tool_path(cache_root)),
+        "--cache-dir",
+        str(pip_cache),
+        f"virtualenv=={VIRTUALENV_VERSION}",
+    )
+
+
+def create_venv_command(venv: Path) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-m",
+        "virtualenv",
+        "--python",
+        sys.executable,
+        str(venv),
+    )
+
+
+def virtualenv_environment(cache_root: Path) -> dict[str, str]:
+    environment = dict(os.environ)
+    tool_path = str(bootstrap_tool_path(cache_root))
+    current = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = tool_path if not current else f"{tool_path}{os.pathsep}{current}"
+    return environment
+
+
 def environment_fingerprint(pins: dict[str, str] = QLAB_PINS) -> str:
     """Return a stable cache key for the explicit scientific runtime contract."""
-    payload = {"schema": FINGERPRINT_SCHEMA, "pins": dict(sorted(pins.items()))}
+    payload = {
+        "schema": FINGERPRINT_SCHEMA,
+        "pins": dict(sorted(pins.items())),
+        "virtualenv": VIRTUALENV_VERSION,
+    }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
@@ -120,6 +163,13 @@ def write_ready_atomic(venv: Path, fingerprint: str, versions: dict[str, str | N
     os.replace(temporary, marker)
 
 
+def interpreter_has_pip(interpreter: Path) -> bool:
+    if not interpreter.exists():
+        return False
+    result = run_bounded((str(interpreter), "-m", "pip", "--version"), timeout=30)
+    return result["returncode"] == 0
+
+
 def ensure_runtime(cache_root: Path, *, dry_run: bool = False) -> tuple[Path, str, list[dict[str, Any]], str | None]:
     fingerprint = environment_fingerprint()
     venv = runtime_path(cache_root, fingerprint)
@@ -135,13 +185,39 @@ def ensure_runtime(cache_root: Path, *, dry_run: bool = False) -> tuple[Path, st
         audit.append({"stage": "stale-marker", "status": "invalidated", "versions": versions})
         (venv / READY_MARKER).unlink(missing_ok=True)
     if dry_run:
-        audit.append({"stage": "build", "status": "would-build", "venv": str(venv),
-                      "commands": [list(command) for command in installation_commands(interpreter, pip_cache)]})
+        commands = (
+            bootstrap_tool_command(cache_root, pip_cache),
+            create_venv_command(venv),
+            *installation_commands(interpreter, pip_cache),
+        )
+        audit.append({
+            "stage": "build",
+            "status": "would-build",
+            "venv": str(venv),
+            "commands": [list(command) for command in commands],
+        })
         return venv, fingerprint, audit, None
     cache_root.mkdir(parents=True, exist_ok=True)
     pip_cache.mkdir(parents=True, exist_ok=True)
+    tool_path = bootstrap_tool_path(cache_root)
+    if not (tool_path / "virtualenv" / "__init__.py").is_file():
+        result = run_bounded(bootstrap_tool_command(cache_root, pip_cache), timeout=300)
+        audit.append({"stage": "install-virtualenv-bootstrap", **result})
+        if result["returncode"] != 0:
+            return venv, fingerprint, audit, "virtualenv-bootstrap-install-failed"
+    if interpreter.exists() and not interpreter_has_pip(interpreter):
+        audit.append({
+            "stage": "partial-venv",
+            "status": "invalidated",
+            "venv": str(venv),
+        })
+        shutil.rmtree(venv)
     if not interpreter.exists():
-        result = run_bounded((sys.executable, "-m", "venv", str(venv)), timeout=300)
+        result = run_bounded(
+            create_venv_command(venv),
+            timeout=300,
+            env=virtualenv_environment(cache_root),
+        )
         audit.append({"stage": "create-venv", **result})
         if result["returncode"] != 0:
             return venv, fingerprint, audit, "create-venv-failed"

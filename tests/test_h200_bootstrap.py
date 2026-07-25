@@ -20,6 +20,9 @@ class H200BootstrapTest(unittest.TestCase):
         self.assertEqual(MODULE.environment_fingerprint(), MODULE.environment_fingerprint(dict(reversed(list(MODULE.QLAB_PINS.items())))))
         changed = dict(MODULE.QLAB_PINS, brax="0.12.4")
         self.assertNotEqual(MODULE.environment_fingerprint(), MODULE.environment_fingerprint(changed))
+        fingerprint = MODULE.environment_fingerprint()
+        with patch.object(MODULE, "VIRTUALENV_VERSION", "different"):
+            self.assertNotEqual(fingerprint, MODULE.environment_fingerprint())
 
     def test_runtime_path_is_versioned_by_fingerprint(self):
         fingerprint = MODULE.environment_fingerprint()
@@ -37,6 +40,49 @@ class H200BootstrapTest(unittest.TestCase):
         self.assertIn("causal-conv1d==1.5.0.post8", commands[2])
         self.assertIn("mamba-ssm==2.2.4", commands[2])
         self.assertNotIn(sys.executable, arguments)
+    def test_virtualenv_bootstrap_does_not_depend_on_ensurepip(self):
+        cache_root = Path("/cache")
+        command = MODULE.bootstrap_tool_command(cache_root, cache_root / "pip/wheels")
+        create = MODULE.create_venv_command(Path("/cache/venvs/runtime"))
+        self.assertEqual(command[:4], (sys.executable, "-m", "pip", "install"))
+        self.assertIn("--target", command)
+        self.assertIn(f"virtualenv=={MODULE.VIRTUALENV_VERSION}", command)
+        self.assertEqual(create[:3], (sys.executable, "-m", "virtualenv"))
+        self.assertNotIn("venv", create)
+
+    def test_partial_environment_without_pip_is_removed_before_recreation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = Path(directory)
+            tool = MODULE.bootstrap_tool_path(cache_root) / "virtualenv"
+            tool.mkdir(parents=True)
+            (tool / "__init__.py").write_text("")
+            interpreter = MODULE.venv_interpreter(
+                MODULE.runtime_path(cache_root, MODULE.environment_fingerprint())
+            )
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_text("")
+            failed_probe = {
+                "command": [],
+                "returncode": 1,
+                "stdout_tail": [],
+                "stderr_tail": [],
+            }
+            failed_create = {
+                "command": [],
+                "returncode": 1,
+                "stdout_tail": [],
+                "stderr_tail": [],
+            }
+            with patch.object(
+                MODULE,
+                "run_bounded",
+                side_effect=[failed_probe, failed_create],
+            ):
+                _, _, audit, reason = MODULE.ensure_runtime(cache_root)
+            self.assertEqual(reason, "create-venv-failed")
+            self.assertEqual(audit[0]["stage"], "partial-venv")
+            self.assertEqual(audit[1]["stage"], "create-venv")
+            self.assertFalse(interpreter.exists())
 
     def test_stale_marker_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
