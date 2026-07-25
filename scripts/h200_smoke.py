@@ -117,10 +117,11 @@ def check_backbones() -> dict:
         builders = (
             ("time", True, lambda: TiMEMamba2(
                 d_model=256, d_state=64, d_conv=4, expand=2,
-                ef_enabled=True, mr_enabled=True,
+                ef_enabled=True, mr_enabled=True, use_mem_eff_path=False,
             )),
             ("vanilla-mamba2", False, lambda: UpstreamMamba2(
                 d_model=256, d_state=64, d_conv=4, expand=2,
+                use_mem_eff_path=False,
             )),
         )
         provenance_mode = "h200-compatibility-unpinned"

@@ -30,15 +30,6 @@ BOOTSTRAP_COMMANDS = (
         "pip",
         "install",
         "--no-build-isolation",
-        "--no-deps",
-        "causal-conv1d==1.6.2.post1",
-    ),
-    (
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--no-build-isolation",
         "mamba-ssm==2.3.2.post1",
     ),
 )
