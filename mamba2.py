@@ -318,7 +318,7 @@ class Mamba2(nn.Module):
                 ), "varlen conv1d requires the causal_conv1d package"
                 xBC = self.act(
                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[
-                        :, -(self.dconv - 1) :
+                        :, : -(self.d_conv - 1)
                     ]
                 )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
             else:

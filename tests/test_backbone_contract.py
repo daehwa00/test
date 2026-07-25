@@ -195,6 +195,31 @@ class BackboneContractTest(unittest.TestCase):
         self.assertIsNotNone(inputs.grad)
         self.assertTrue(torch.isfinite(inputs.grad).all())
 
+    def test_unfused_local_backbone_works_without_causal_extension(self):
+        import mamba2
+
+        previous = mamba2.causal_conv1d_fn
+        mamba2.causal_conv1d_fn = None
+        try:
+            model = mamba2.Mamba2(
+                d_model=256,
+                d_state=64,
+                d_conv=4,
+                expand=2,
+                ef_enabled=True,
+                mr_enabled=True,
+                use_mem_eff_path=False,
+            ).cuda()
+            inputs = torch.randn(2, 8, 256, device="cuda", requires_grad=True)
+            resets = torch.zeros(2, 8, dtype=torch.bool, device="cuda")
+            resets[:, 4] = True
+            output = model(inputs, resets=resets)
+            self.assertEqual(output.shape, inputs.shape)
+            self.assertTrue(torch.isfinite(output).all())
+            output.square().mean().backward()
+            self.assertTrue(torch.isfinite(inputs.grad).all())
+        finally:
+            mamba2.causal_conv1d_fn = previous
     def test_brax_torch_bridge_runs_on_cuda(self):
         from env_utils import create_env
 
