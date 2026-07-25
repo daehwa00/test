@@ -112,7 +112,7 @@ def check_backbones() -> dict:
         inputs = torch.randn(2, 8, 256, device="cuda", requires_grad=True)
         resets = torch.zeros(2, 8, dtype=torch.bool, device="cuda")
         resets[:, 4] = True
-        output = model(inputs, resets=resets)
+        output = model(inputs, resets=resets) if ef_enabled else model(inputs)
         loss = output.square().mean()
         loss.backward()
         if output.shape != inputs.shape or not torch.isfinite(output).all():
@@ -169,6 +169,7 @@ def check_one_update() -> dict:
         "ef_enabled": True,
         "mr_enabled": True,
         "reset_dt": 5.0,
+        "epsilon": 0.2,
         "episode_length": 5_000,
         "keep_dims_override": [0, 1, 2, 3, 4],
         "num_envs": 8,
