@@ -19,7 +19,7 @@ BOOTSTRAP_COMMANDS = (
         "-m",
         "pip",
         "install",
-        "jax[cuda13]",
+        "jax[cuda12]==0.6.0",
         "brax==0.12.3",
         "ninja==1.11.1.4",
         "einops==0.8.1",
@@ -31,7 +31,7 @@ BOOTSTRAP_COMMANDS = (
         "install",
         "--no-build-isolation",
         "--no-deps",
-        "causal-conv1d==1.5.0.post8",
+        "causal-conv1d==1.6.2.post1",
     ),
     (
         sys.executable,

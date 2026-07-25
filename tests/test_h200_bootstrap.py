@@ -23,8 +23,12 @@ class H200BootstrapTest(unittest.TestCase):
             self.assertIn("--no-build-isolation", command)
             self.assertIn("--no-deps", command)
 
-    def test_cuda13_jax_is_requested(self):
-        self.assertIn("jax[cuda13]", MODULE.BOOTSTRAP_COMMANDS[0])
+    def test_cuda12_jax_runtime_is_pinned_for_driver_compatibility(self):
+        self.assertIn("jax[cuda12]==0.6.0", MODULE.BOOTSTRAP_COMMANDS[0])
+        self.assertNotIn("jax[cuda13]", MODULE.BOOTSTRAP_COMMANDS[0])
+
+    def test_h200_compatible_causal_conv_release_is_used(self):
+        self.assertIn("causal-conv1d==1.6.2.post1", MODULE.BOOTSTRAP_COMMANDS[1])
 
 
 if __name__ == "__main__":
