@@ -39,6 +39,8 @@ class H200BootstrapTest(unittest.TestCase):
         self.assertIn(MODULE.PYTORCH_CU124_INDEX, commands[0])
         self.assertIn("causal-conv1d==1.5.0.post8", commands[2])
         self.assertIn("mamba-ssm==2.2.4", commands[2])
+        self.assertIn("nvidia-cudnn-cu12==9.8.0.87", commands[3])
+        self.assertIn("--no-deps", commands[3])
         self.assertNotIn(sys.executable, arguments)
     def test_virtualenv_bootstrap_does_not_depend_on_ensurepip(self):
         cache_root = Path("/cache")

@@ -34,6 +34,7 @@ QLAB_PINS = {
     "jaxlib": "0.6.0",
     "mamba-ssm": "2.2.4",
     "ninja": "1.11.1.4",
+    "nvidia-cudnn-cu12": "9.8.0.87",
     "torch": "2.6.0+cu124",
     "triton": "3.2.0",
 }
@@ -113,6 +114,10 @@ def installation_commands(interpreter: Path, pip_cache: Path) -> tuple[tuple[str
                f"einops=={QLAB_PINS['einops']}", f"ninja=={QLAB_PINS['ninja']}"),
         pip + ("--no-build-isolation", f"causal-conv1d=={QLAB_PINS['causal-conv1d']}",
                f"mamba-ssm=={QLAB_PINS['mamba-ssm']}"),
+        pip + (
+            "--no-deps",
+            f"nvidia-cudnn-cu12=={QLAB_PINS['nvidia-cudnn-cu12']}",
+        ),
     )
 
 
@@ -225,8 +230,11 @@ def ensure_runtime(cache_root: Path, *, dry_run: bool = False) -> tuple[Path, st
         result = run_bounded(command, timeout=1_200)
         audit.append({"stage": f"install-{index}", **result})
         if result["returncode"] != 0:
-            # CUDA 13 host toolkits cannot safely build extensions for the CUDA 12.4 torch wheel.
-            return venv, fingerprint, audit, "cuda12.4-extension-build-failed" if index == 3 else "dependency-install-failed"
+            if index == 3:
+                return venv, fingerprint, audit, "cuda12.4-extension-build-failed"
+            if index == 4:
+                return venv, fingerprint, audit, "qlab-cudnn-runtime-install-failed"
+            return venv, fingerprint, audit, "dependency-install-failed"
     exact, versions = exact_versions(interpreter)
     audit.append({"stage": "exact-version-validation", "status": "passed" if exact else "failed", "versions": versions})
     if not exact:

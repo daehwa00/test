@@ -23,6 +23,10 @@ class H200SmokeTest(unittest.TestCase):
         self.assertEqual(MODULE.EXPECTED_QLAB_VERSIONS["einops"], "0.8.1")
         self.assertEqual(MODULE.EXPECTED_QLAB_VERSIONS["ninja"], "1.11.1.4")
         self.assertEqual(MODULE.EXPECTED_QLAB_VERSIONS["mamba-ssm"], "2.2.4")
+        self.assertEqual(
+            MODULE.EXPECTED_QLAB_VERSIONS["nvidia-cudnn-cu12"],
+            "9.8.0.87",
+        )
 
     def test_stage_records_success(self):
         receipt = MODULE.Receipt()

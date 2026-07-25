@@ -21,7 +21,8 @@ if str(ROOT) not in sys.path:
 EXPECTED_QLAB_VERSIONS = {
     "brax": "0.12.3", "causal-conv1d": "1.5.0.post8", "einops": "0.8.1",
     "jax": "0.6.0", "jaxlib": "0.6.0", "mamba-ssm": "2.2.4",
-    "ninja": "1.11.1.4", "torch": "2.6.0+cu124", "triton": "3.2.0",
+    "ninja": "1.11.1.4", "nvidia-cudnn-cu12": "9.8.0.87",
+    "torch": "2.6.0+cu124", "triton": "3.2.0",
 }
 
 
