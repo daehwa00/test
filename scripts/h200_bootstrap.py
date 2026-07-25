@@ -1,87 +1,186 @@
-"""Install only missing H200 smoke dependencies, then run the bounded probe.
+"""Build or reuse the pinned, isolated qlab H200 runtime and run its smoke probe.
 
-The Aerodrone base image owns Torch, CUDA, and Triton. This bootstrap never upgrades
-or replaces them. Build logs are bounded so the issue-comment output stays useful.
+The H200 base image is deliberately never modified.  A versioned virtual environment
+under the persistent scratch cache is considered ready only after its exact pins have
+been checked and an atomic marker has been written.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+from typing import Any
+
+CACHE_ROOT = Path("/app/scratch/cache")
+RUNTIME_NAME = "time-h200-qlab"
+READY_MARKER = "READY.json"
+FINGERPRINT_SCHEMA = 1
+PYTORCH_CU124_INDEX = "https://download.pytorch.org/whl/cu124"
+
+# This is intentionally the single source of the scientific runtime contract.
+QLAB_PINS = {
+    "brax": "0.12.3",
+    "causal-conv1d": "1.5.0.post8",
+    "einops": "0.8.1",
+    "jax": "0.6.0",
+    "jaxlib": "0.6.0",
+    "mamba-ssm": "2.2.4",
+    "ninja": "1.11.1.4",
+    "torch": "2.6.0+cu124",
+    "triton": "3.2.0",
+}
 
 
-BOOTSTRAP_COMMANDS = (
-    (
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "jax[cuda12]==0.6.0",
-        "brax==0.12.3",
-        "ninja==1.11.1.4",
-        "einops==0.8.1",
-    ),
-    (
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--no-build-isolation",
-        "mamba-ssm==2.3.2.post1",
-    ),
-)
+def environment_fingerprint(pins: dict[str, str] = QLAB_PINS) -> str:
+    """Return a stable cache key for the explicit scientific runtime contract."""
+    payload = {"schema": FINGERPRINT_SCHEMA, "pins": dict(sorted(pins.items()))}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
-def run_bounded(command: tuple[str, ...], timeout: int) -> dict:
-    completed = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
+def runtime_path(cache_root: Path, fingerprint: str) -> Path:
+    return cache_root / "venvs" / f"{RUNTIME_NAME}-{fingerprint}"
+
+
+def venv_interpreter(venv: Path) -> Path:
+    return venv / "bin" / "python"
+
+
+def run_bounded(command: tuple[str, ...], timeout: int, *, env: dict[str, str] | None = None) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as exc:
+        return {"command": list(command), "returncode": None, "stdout_tail": (exc.stdout or "").splitlines()[-40:],
+                "stderr_tail": (exc.stderr or "").splitlines()[-40:], "timed_out": True}
+    return {"command": list(command), "returncode": completed.returncode,
+            "stdout_tail": completed.stdout.splitlines()[-40:], "stderr_tail": completed.stderr.splitlines()[-40:]}
+
+
+def installation_commands(interpreter: Path, pip_cache: Path) -> tuple[tuple[str, ...], ...]:
+    pip = (str(interpreter), "-m", "pip", "install", "--cache-dir", str(pip_cache))
+    return (
+        pip + ("--index-url", PYTORCH_CU124_INDEX, f"torch=={QLAB_PINS['torch']}", f"triton=={QLAB_PINS['triton']}"),
+        pip + (f"jax[cuda12]=={QLAB_PINS['jax']}", f"jaxlib=={QLAB_PINS['jaxlib']}", f"brax=={QLAB_PINS['brax']}",
+               f"einops=={QLAB_PINS['einops']}", f"ninja=={QLAB_PINS['ninja']}"),
+        pip + ("--no-build-isolation", f"causal-conv1d=={QLAB_PINS['causal-conv1d']}",
+               f"mamba-ssm=={QLAB_PINS['mamba-ssm']}"),
     )
-    return {
-        "command": list(command),
-        "returncode": completed.returncode,
-        "stdout_tail": completed.stdout.splitlines()[-40:],
-        "stderr_tail": completed.stderr.splitlines()[-40:],
-    }
+
+
+def installed_versions(interpreter: Path) -> dict[str, str | None] | None:
+    probe = """import importlib.metadata as m, json
+pins=json.loads(%r)
+out={}
+for name in pins:
+ try: out[name]=m.version(name)
+ except m.PackageNotFoundError: out[name]=None
+try:
+ import torch
+ out['torch']=torch.__version__
+except Exception: pass
+print(json.dumps(out, sort_keys=True))""" % json.dumps(QLAB_PINS)
+    result = run_bounded((str(interpreter), "-c", probe), timeout=60)
+    if result["returncode"] != 0 or not result["stdout_tail"]:
+        return None
+    try:
+        return json.loads(result["stdout_tail"][-1])
+    except json.JSONDecodeError:
+        return None
+
+
+def exact_versions(interpreter: Path) -> tuple[bool, dict[str, str | None] | None]:
+    versions = installed_versions(interpreter)
+    return versions is not None and versions == QLAB_PINS, versions
+
+
+def read_ready(venv: Path, fingerprint: str) -> dict[str, Any] | None:
+    try:
+        marker = json.loads((venv / READY_MARKER).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if marker.get("fingerprint") != fingerprint or marker.get("pins") != QLAB_PINS:
+        return None
+    return marker
+
+
+def write_ready_atomic(venv: Path, fingerprint: str, versions: dict[str, str | None]) -> None:
+    marker = venv / READY_MARKER
+    payload = {"schema": FINGERPRINT_SCHEMA, "fingerprint": fingerprint, "pins": QLAB_PINS,
+               "versions": versions, "interpreter": str(venv_interpreter(venv))}
+    with tempfile.NamedTemporaryFile("w", dir=venv, prefix=".ready-", delete=False) as stream:
+        json.dump(payload, stream, sort_keys=True)
+        stream.write("\n")
+        temporary = Path(stream.name)
+    os.replace(temporary, marker)
+
+
+def ensure_runtime(cache_root: Path, *, dry_run: bool = False) -> tuple[Path, str, list[dict[str, Any]], str | None]:
+    fingerprint = environment_fingerprint()
+    venv = runtime_path(cache_root, fingerprint)
+    interpreter = venv_interpreter(venv)
+    pip_cache = cache_root / "pip" / "wheels"
+    audit: list[dict[str, Any]] = []
+    marker = read_ready(venv, fingerprint)
+    exact, versions = exact_versions(interpreter) if marker and interpreter.exists() else (False, None)
+    if marker and exact:
+        audit.append({"stage": "cache-reuse", "status": "passed", "versions": versions})
+        return venv, fingerprint, audit, None
+    if marker:
+        audit.append({"stage": "stale-marker", "status": "invalidated", "versions": versions})
+        (venv / READY_MARKER).unlink(missing_ok=True)
+    if dry_run:
+        audit.append({"stage": "build", "status": "would-build", "venv": str(venv),
+                      "commands": [list(command) for command in installation_commands(interpreter, pip_cache)]})
+        return venv, fingerprint, audit, None
+    cache_root.mkdir(parents=True, exist_ok=True)
+    pip_cache.mkdir(parents=True, exist_ok=True)
+    if not interpreter.exists():
+        result = run_bounded((sys.executable, "-m", "venv", str(venv)), timeout=300)
+        audit.append({"stage": "create-venv", **result})
+        if result["returncode"] != 0:
+            return venv, fingerprint, audit, "create-venv-failed"
+    for index, command in enumerate(installation_commands(interpreter, pip_cache), start=1):
+        result = run_bounded(command, timeout=1_200)
+        audit.append({"stage": f"install-{index}", **result})
+        if result["returncode"] != 0:
+            # CUDA 13 host toolkits cannot safely build extensions for the CUDA 12.4 torch wheel.
+            return venv, fingerprint, audit, "cuda12.4-extension-build-failed" if index == 3 else "dependency-install-failed"
+    exact, versions = exact_versions(interpreter)
+    audit.append({"stage": "exact-version-validation", "status": "passed" if exact else "failed", "versions": versions})
+    if not exact:
+        return venv, fingerprint, audit, "exact-version-validation-failed"
+    write_ready_atomic(venv, fingerprint, versions)
+    audit.append({"stage": "atomic-ready-marker", "status": "passed"})
+    return venv, fingerprint, audit, None
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cache-root", type=Path, default=CACHE_ROOT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    venv, fingerprint, audit, reason = ensure_runtime(args.cache_root, dry_run=args.dry_run)
+    result: dict[str, Any] = {"passed": False, "fingerprint": fingerprint, "venv": str(venv),
+                              "interpreter": str(venv_interpreter(venv)), "audit": audit}
+    if reason:
+        result["reason"] = reason
+        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+        return 1
     if args.dry_run:
-        print(json.dumps({"bootstrap_commands": BOOTSTRAP_COMMANDS}))
+        result["passed"] = True
+        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
         return 0
-
-    installs = []
-    for command in BOOTSTRAP_COMMANDS:
-        result = run_bounded(command, timeout=1_200)
-        installs.append(result)
-        if result["returncode"] != 0:
-            print("H200_BOOTSTRAP_RESULT=" + json.dumps({
-                "passed": False,
-                "installs": installs,
-                "reason": "dependency-install-failed",
-            }, sort_keys=True))
-            return 1
-
-    smoke = run_bounded(
-        (sys.executable, str(Path(__file__).with_name("h200_smoke.py"))),
-        timeout=1_800,
-    )
-    print("H200_BOOTSTRAP_RESULT=" + json.dumps({
-        "passed": smoke["returncode"] == 0,
-        "installs": installs,
-        "smoke": smoke,
-    }, sort_keys=True))
-    return smoke["returncode"]
+    smoke = run_bounded((str(venv_interpreter(venv)), str(Path(__file__).with_name("h200_smoke.py")),
+                         "--scientific", "--cache-fingerprint", fingerprint, "--venv", str(venv)), timeout=1_800)
+    result.update({"smoke": smoke, "passed": smoke["returncode"] == 0})
+    print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+    return 0 if result["passed"] else 1
 
 
 if __name__ == "__main__":

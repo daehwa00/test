@@ -1,12 +1,8 @@
-"""Bounded Aerodrone H200 compatibility probe for the TiME Brax stack.
-
-This is intentionally not a scientific campaign. It prints one compact JSON receipt,
-exercises both matched backbones, the Brax/Torch bridge, and one tiny corrected-v2
-training update, then exits non-zero if any runtime stage fails.
-"""
+"""Fail-closed qlab-pinned H200 scientific smoke probe for the TiME Brax stack."""
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.metadata
 import io
@@ -22,25 +18,21 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
 EXPECTED_QLAB_VERSIONS = {
-    "brax": "0.12.3",
-    "causal-conv1d": "1.5.0.post8",
-    "jax": "0.6.0",
-    "jaxlib": "0.6.0",
-    "mamba-ssm": "2.2.4",
-    "torch": "2.6.0+cu124",
-    "triton": "3.2.0",
+    "brax": "0.12.3", "causal-conv1d": "1.5.0.post8", "einops": "0.8.1",
+    "jax": "0.6.0", "jaxlib": "0.6.0", "mamba-ssm": "2.2.4",
+    "ninja": "1.11.1.4", "torch": "2.6.0+cu124", "triton": "3.2.0",
 }
 
 
 @dataclass
 class Receipt:
-    schema_version: int = 1
-    kind: str = "time-h200-compatibility-smoke"
+    schema_version: int = 2
+    kind: str = "time-h200-qlab-scientific-smoke"
     runtime: dict = field(default_factory=dict)
     versions: dict = field(default_factory=dict)
     version_match: dict = field(default_factory=dict)
+    cache: dict = field(default_factory=dict)
     stages: list[dict] = field(default_factory=list)
     scientific_compatible_with_qlab: bool = False
     passed: bool = False
@@ -48,14 +40,9 @@ class Receipt:
     def stage(self, name: str, operation: Callable[[], dict]) -> None:
         try:
             evidence = operation()
-        except Exception as exc:  # The receipt must survive dependency/kernel failures.
-            self.stages.append({
-                "name": name,
-                "status": "failed",
-                "error_type": type(exc).__name__,
-                "error": str(exc)[:1000],
-                "traceback_tail": traceback.format_exc().splitlines()[-8:],
-            })
+        except Exception as exc:
+            self.stages.append({"name": name, "status": "failed", "error_type": type(exc).__name__,
+                                "error": str(exc)[:1000], "traceback_tail": traceback.format_exc().splitlines()[-8:]})
         else:
             self.stages.append({"name": name, "status": "passed", **evidence})
 
@@ -67,24 +54,28 @@ def installed_version(distribution: str) -> str | None:
         return None
 
 
+def installed_versions() -> dict[str, str | None]:
+    versions = {name: installed_version(name) for name in EXPECTED_QLAB_VERSIONS}
+    try:
+        import torch
+        versions["torch"] = torch.__version__
+    except ImportError:
+        pass
+    return versions
+
+
 def collect_runtime(receipt: Receipt) -> None:
     import torch
-
-    receipt.runtime = {
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "cuda_available": torch.cuda.is_available(),
-        "torch_cuda": torch.version.cuda,
-        "gpu_count": torch.cuda.device_count(),
-        "gpus": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())],
-    }
+    receipt.runtime = {"python": platform.python_version(), "platform": platform.platform(),
+                       "interpreter": sys.executable, "cuda_available": torch.cuda.is_available(),
+                       "torch_cuda": torch.version.cuda, "gpu_count": torch.cuda.device_count(),
+                       "gpus": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]}
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
 
 
 def check_jax_cuda() -> dict:
     import jax
-
     devices = [str(device) for device in jax.devices()]
     if not any(getattr(device, "platform", None) == "gpu" for device in jax.devices()):
         raise RuntimeError(f"JAX has no GPU device: {devices}")
@@ -93,39 +84,10 @@ def check_jax_cuda() -> dict:
 
 def check_backbones() -> dict:
     import torch
-
-    installed_mamba = installed_version("mamba-ssm")
+    from TiME.backbones import build_backbone
     implementations = {}
-    if installed_mamba == EXPECTED_QLAB_VERSIONS["mamba-ssm"]:
-        from TiME.backbones import build_backbone
-
-        builders = (
-            ("time", True, lambda: build_backbone(
-                d_model=256, d_state=64, d_conv=4, expand=2,
-                ef_enabled=True, mr_enabled=True,
-            )),
-            ("vanilla-mamba2", False, lambda: build_backbone(
-                d_model=256, d_state=64, d_conv=4, expand=2,
-                ef_enabled=False, mr_enabled=False,
-            )),
-        )
-        provenance_mode = "pinned-qlab"
-    else:
-        from mamba2 import Mamba2 as TiMEMamba2
-        from mamba_ssm.modules.mamba2 import Mamba2 as UpstreamMamba2
-
-        builders = (
-            ("time", True, lambda: TiMEMamba2(
-                d_model=256, d_state=64, d_conv=4, expand=2,
-                ef_enabled=True, mr_enabled=True, use_mem_eff_path=False,
-            )),
-            ("vanilla-mamba2", False, lambda: UpstreamMamba2(
-                d_model=256, d_state=64, d_conv=4, expand=2,
-                use_mem_eff_path=False,
-            )),
-        )
-        provenance_mode = "h200-compatibility-unpinned"
-
+    builders = (("time", True, lambda: build_backbone(d_model=256, d_state=64, d_conv=4, expand=2, ef_enabled=True, mr_enabled=True)),
+                ("vanilla-mamba2", False, lambda: build_backbone(d_model=256, d_state=64, d_conv=4, expand=2, ef_enabled=False, mr_enabled=False)))
     for name, uses_resets, builder in builders:
         model = builder().cuda()
         inputs = torch.randn(2, 8, 256, device="cuda", requires_grad=True)
@@ -141,73 +103,33 @@ def check_backbones() -> dict:
         implementations[name] = type(model).__module__
         del model, inputs, output, loss
     torch.cuda.synchronize()
-    return {
-        "implementations": implementations,
-        "mamba_ssm_version": installed_mamba,
-        "provenance_mode": provenance_mode,
-    }
+    return {"implementations": implementations, "mamba_ssm_version": installed_version("mamba-ssm"), "provenance_mode": "pinned-qlab"}
 
 
 def check_brax_torch_bridge() -> dict:
     import torch
-
     from env_utils import create_env
-
-    env = create_env(
-        "ant",
-        "cuda",
-        seed=7,
-        num_envs=2,
-        episode_length=5_000,
-        keep_dims_override=[0, 1, 2, 3, 4],
-    )
+    env = create_env("ant", "cuda", seed=7, num_envs=2, episode_length=5_000, keep_dims_override=[0, 1, 2, 3, 4])
     observation = env.reset()
-    next_observation, reward, done, info = env.step(
-        torch.zeros(env.action_space.shape, device="cuda")
-    )
+    next_observation, reward, done, info = env.step(torch.zeros(env.action_space.shape, device="cuda"))
     if observation.shape != (2, 5) or next_observation.shape != observation.shape:
         raise RuntimeError("unexpected masked Ant observation shape")
     if not torch.isfinite(next_observation).all() or not torch.isfinite(reward).all():
         raise RuntimeError("Brax/Torch bridge produced non-finite values")
-    return {
-        "observation_shape": list(observation.shape),
-        "reward_shape": list(reward.shape),
-        "done_shape": list(done.shape),
-        "has_truncation": "truncation" in info,
-    }
+    return {"observation_shape": list(observation.shape), "reward_shape": list(reward.shape),
+            "done_shape": list(done.shape), "has_truncation": "truncation" in info}
 
 
 def check_one_update() -> dict:
     from env_utils import ENV_HYPERPARAMS
     from trainer import train
-
     events: list[dict] = []
-    config = {
-        **ENV_HYPERPARAMS["ant"],
-        "protocol": "time-brax-corrected-v2-h200-smoke",
-        "device": "cuda",
-        "seed": 0,
-        "env_name": "ant",
-        "use_wandb": False,
-        "ef_enabled": True,
-        "mr_enabled": True,
-        "reset_dt": 5.0,
-        "epsilon": 0.2,
-        "episode_length": 5_000,
-        "keep_dims_override": [0, 1, 2, 3, 4],
-        "num_envs": 8,
-        "unroll_length": 32,
-        "num_timesteps": 256,
-        "num_minibatches": 2,
-        "num_update_epochs": 1,
-        "evaluation_points": 2,
-        "evaluation_intermediate_episodes": 2,
-        "evaluation_final_episodes": 2,
-        "delta_telemetry_enabled": True,
-        "delta_telemetry_points": 2,
-        "delta_telemetry_probe_sequences": 2,
-        "history_recorder": events.append,
-    }
+    config = {**ENV_HYPERPARAMS["ant"], "protocol": "time-brax-corrected-v2-h200-smoke", "device": "cuda", "seed": 0,
+              "env_name": "ant", "use_wandb": False, "ef_enabled": True, "mr_enabled": True, "reset_dt": 5.0, "epsilon": 0.2,
+              "episode_length": 5_000, "keep_dims_override": [0, 1, 2, 3, 4], "num_envs": 8, "unroll_length": 32,
+              "num_timesteps": 256, "num_minibatches": 2, "num_update_epochs": 1, "evaluation_points": 2,
+              "evaluation_intermediate_episodes": 2, "evaluation_final_episodes": 2, "delta_telemetry_enabled": True,
+              "delta_telemetry_points": 2, "delta_telemetry_probe_sequences": 2, "history_recorder": events.append}
     captured = io.StringIO()
     with contextlib.redirect_stdout(captured):
         train(config=config, env_name="ant")
@@ -215,44 +137,34 @@ def check_one_update() -> dict:
     for event in events:
         name = str(event.get("event", "unknown"))
         event_counts[name] = event_counts.get(name, 0) + 1
-    required = {"shared_initialization_verified", "evaluation", "delta_telemetry"}
-    missing = sorted(required - event_counts.keys())
+    missing = sorted({"shared_initialization_verified", "evaluation", "delta_telemetry"} - event_counts.keys())
     if missing:
         raise RuntimeError(f"training receipt is missing events: {missing}")
-    return {
-        "num_timesteps": config["num_timesteps"],
-        "episode_length": config["episode_length"],
-        "event_counts": event_counts,
-        "captured_stdout_tail": captured.getvalue().splitlines()[-8:],
-    }
+    return {"num_timesteps": config["num_timesteps"], "episode_length": config["episode_length"],
+            "event_counts": event_counts, "captured_stdout_tail": captured.getvalue().splitlines()[-8:]}
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scientific", action="store_true", default=True)
+    parser.add_argument("--cache-fingerprint")
+    parser.add_argument("--venv")
+    args = parser.parse_args()
     receipt = Receipt()
-    receipt.versions = {
-        name: installed_version(name) for name in EXPECTED_QLAB_VERSIONS
-    }
-    receipt.version_match = {
-        name: receipt.versions[name] == expected
-        for name, expected in EXPECTED_QLAB_VERSIONS.items()
-    }
+    receipt.cache = {"fingerprint": args.cache_fingerprint, "venv": args.venv, "interpreter": sys.executable}
+    receipt.versions = installed_versions()
+    receipt.version_match = {name: receipt.versions[name] == expected for name, expected in EXPECTED_QLAB_VERSIONS.items()}
     receipt.scientific_compatible_with_qlab = all(receipt.version_match.values())
-    receipt.stage("cuda-runtime", lambda: (collect_runtime(receipt) or receipt.runtime))
-    if receipt.stages[-1]["status"] == "passed":
-        receipt.stage("jax-cuda", check_jax_cuda)
-        receipt.stage("time-and-vanilla-backbones", check_backbones)
-        receipt.stage("brax-torch-dlpack", check_brax_torch_bridge)
-        if receipt.scientific_compatible_with_qlab:
+    if not receipt.scientific_compatible_with_qlab:
+        receipt.stages.append({"name": "exact-qlab-pins", "status": "failed", "reason": "exact-pins-required-for-scientific-smoke", "version_match": receipt.version_match})
+    else:
+        receipt.stage("cuda-runtime", lambda: (collect_runtime(receipt) or receipt.runtime))
+        if receipt.stages[-1]["status"] == "passed":
+            receipt.stage("jax-cuda", check_jax_cuda)
+            receipt.stage("time-and-vanilla-backbones", check_backbones)
+            receipt.stage("brax-torch-dlpack", check_brax_torch_bridge)
             receipt.stage("corrected-v2-one-update", check_one_update)
-        else:
-            receipt.stages.append({
-                "name": "corrected-v2-one-update",
-                "status": "not_applicable",
-                "reason": "installed Mamba stack differs from the pinned qlab protocol",
-            })
-    receipt.passed = bool(receipt.stages) and all(
-        stage["status"] in {"passed", "not_applicable"} for stage in receipt.stages
-    )
+    receipt.passed = receipt.scientific_compatible_with_qlab and bool(receipt.stages) and all(stage["status"] == "passed" for stage in receipt.stages)
     print("H200_SMOKE_RESULT=" + json.dumps(receipt.__dict__, sort_keys=True))
     return 0 if receipt.passed else 1
 
