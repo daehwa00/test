@@ -114,6 +114,45 @@ class H200BootstrapTest(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], str(MODULE.venv_interpreter(venv)))
         self.assertIn("--scientific", command)
+        self.assertEqual(run.call_count, 1)
+
+    def test_campaign_requires_authorization_and_never_starts_by_default(self):
+        venv = Path("/cache/venvs/time-h200-qlab-test")
+        with patch.object(MODULE, "ensure_runtime", return_value=(venv, "test", [], None)), \
+             patch.object(MODULE, "run_bounded") as run, \
+             patch.object(sys, "argv", ["h200_bootstrap.py", "--campaign", "standard-primary"]):
+            self.assertEqual(MODULE.main(), 1)
+        run.assert_not_called()
+
+    def test_campaign_runs_after_smoke_with_bounded_twelve_hour_timeout(self):
+        venv = Path("/cache/venvs/time-h200-qlab-test")
+        passed = {"command": [], "returncode": 0, "stdout_tail": [], "stderr_tail": []}
+        with patch.object(MODULE, "ensure_runtime", return_value=(venv, "test", [], None)), \
+             patch.object(MODULE, "run_bounded", side_effect=[passed, passed]) as run, \
+             patch.object(sys, "argv", [
+                 "h200_bootstrap.py", "--campaign", "standard-primary",
+                 "--authorize-full-execution",
+             ]):
+            self.assertEqual(MODULE.main(), 0)
+        smoke_call, campaign_call = run.call_args_list
+        self.assertIn("h200_smoke.py", smoke_call.args[0][1])
+        self.assertIn("h200_campaign.py", campaign_call.args[0][1])
+        self.assertEqual(campaign_call.kwargs["timeout"], 12 * 60 * 60)
+        self.assertIn("--authorize-full-execution", campaign_call.args[0])
+
+    def test_campaign_dry_run_exposes_command_without_dispatch(self):
+        venv = Path("/cache/venvs/time-h200-qlab-test")
+        with patch.object(MODULE, "ensure_runtime", return_value=(venv, "test", [], None)), \
+             patch.object(MODULE, "run_bounded") as run, \
+             patch.object(sys, "argv", [
+                 "h200_bootstrap.py", "--dry-run", "--campaign", "standard-primary",
+             ]), \
+             patch("builtins.print") as printed:
+            self.assertEqual(MODULE.main(), 0)
+        run.assert_not_called()
+        receipt = json.loads(printed.call_args.args[0].split("=", 1)[1])
+        self.assertEqual(receipt["campaign"]["status"], "would-run")
+        self.assertIn("h200_campaign.py", receipt["campaign"]["command"][1])
 
 
 if __name__ == "__main__":

@@ -24,6 +24,19 @@ READY_MARKER = "READY.json"
 FINGERPRINT_SCHEMA = 1
 PYTORCH_CU124_INDEX = "https://download.pytorch.org/whl/cu124"
 VIRTUALENV_VERSION = "20.31.2"
+CAMPAIGN_TIMEOUT_SECONDS = 12 * 60 * 60
+STANDARD_PRIMARY_CAMPAIGN = "standard-primary"
+
+
+def campaign_command(interpreter: Path, output_dir: Path) -> tuple[str, ...]:
+    """Build the only authorized H200 campaign invocation."""
+    return (
+        str(interpreter),
+        str(Path(__file__).with_name("h200_campaign.py")),
+        "--output-dir",
+        str(output_dir),
+        "--authorize-full-execution",
+    )
 
 # This is intentionally the single source of the scientific runtime contract.
 QLAB_PINS = {
@@ -248,21 +261,55 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-root", type=Path, default=CACHE_ROOT)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--campaign", choices=(STANDARD_PRIMARY_CAMPAIGN,))
+    parser.add_argument("--authorize-full-execution", action="store_true")
+    parser.add_argument(
+        "--campaign-output-dir", type=Path,
+        default=Path("results/h200-standard-primary"),
+    )
     args = parser.parse_args()
     venv, fingerprint, audit, reason = ensure_runtime(args.cache_root, dry_run=args.dry_run)
-    result: dict[str, Any] = {"passed": False, "fingerprint": fingerprint, "venv": str(venv),
-                              "interpreter": str(venv_interpreter(venv)), "audit": audit}
+    interpreter = venv_interpreter(venv)
+    result: dict[str, Any] = {
+        "passed": False,
+        "fingerprint": fingerprint,
+        "venv": str(venv),
+        "interpreter": str(interpreter),
+        "audit": audit,
+    }
+    if args.campaign:
+        command = campaign_command(interpreter, args.campaign_output_dir)
+        result["campaign"] = {"name": args.campaign, "command": list(command)}
     if reason:
         result["reason"] = reason
         print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
         return 1
     if args.dry_run:
+        if args.campaign:
+            result["campaign"]["status"] = "would-run"
         result["passed"] = True
         print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
         return 0
-    smoke = run_bounded((str(venv_interpreter(venv)), str(Path(__file__).with_name("h200_smoke.py")),
-                         "--scientific", "--cache-fingerprint", fingerprint, "--venv", str(venv)), timeout=1_800)
-    result.update({"smoke": smoke, "passed": smoke["returncode"] == 0})
+    if args.campaign and not args.authorize_full_execution:
+        result["reason"] = "campaign-requires-authorize-full-execution"
+        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+        return 1
+    smoke = run_bounded(
+        (str(interpreter), str(Path(__file__).with_name("h200_smoke.py")),
+         "--scientific", "--cache-fingerprint", fingerprint, "--venv", str(venv)),
+        timeout=1_800,
+    )
+    result["smoke"] = smoke
+    if smoke["returncode"] != 0:
+        result["passed"] = False
+        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+        return 1
+    if args.campaign:
+        campaign = run_bounded(command, timeout=CAMPAIGN_TIMEOUT_SECONDS)
+        result["campaign"]["result"] = campaign
+        result["passed"] = campaign["returncode"] == 0
+    else:
+        result["passed"] = True
     print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
     return 0 if result["passed"] else 1
 
