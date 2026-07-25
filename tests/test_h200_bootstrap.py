@@ -18,10 +18,10 @@ class H200BootstrapTest(unittest.TestCase):
         self.assertFalse(any(argument.startswith("torch") for argument in arguments))
         self.assertFalse(any(argument.startswith("triton") for argument in arguments))
 
-    def test_native_extensions_disable_build_isolation_and_dependencies(self):
-        for command in MODULE.BOOTSTRAP_COMMANDS[1:]:
-            self.assertIn("--no-build-isolation", command)
-            self.assertIn("--no-deps", command)
+    def test_causal_extension_disables_build_isolation_and_dependencies(self):
+        command = MODULE.BOOTSTRAP_COMMANDS[1]
+        self.assertIn("--no-build-isolation", command)
+        self.assertIn("--no-deps", command)
 
     def test_cuda12_jax_runtime_is_pinned_for_driver_compatibility(self):
         self.assertIn("jax[cuda12]==0.6.0", MODULE.BOOTSTRAP_COMMANDS[0])
@@ -29,6 +29,12 @@ class H200BootstrapTest(unittest.TestCase):
 
     def test_h200_compatible_causal_conv_release_is_used(self):
         self.assertIn("causal-conv1d==1.6.2.post1", MODULE.BOOTSTRAP_COMMANDS[1])
+
+    def test_h200_mamba_release_installs_required_runtime_dependencies(self):
+        command = MODULE.BOOTSTRAP_COMMANDS[2]
+        self.assertIn("mamba-ssm==2.3.2.post1", command)
+        self.assertIn("--no-build-isolation", command)
+        self.assertNotIn("--no-deps", command)
 
 
 if __name__ == "__main__":

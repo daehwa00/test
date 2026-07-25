@@ -39,8 +39,7 @@ BOOTSTRAP_COMMANDS = (
         "pip",
         "install",
         "--no-build-isolation",
-        "--no-deps",
-        "mamba-ssm==2.2.4",
+        "mamba-ssm==2.3.2.post1",
     ),
 )
 

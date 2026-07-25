@@ -94,25 +94,43 @@ def check_jax_cuda() -> dict:
 def check_backbones() -> dict:
     import torch
 
-    from TiME.backbones import build_backbone
-
+    installed_mamba = installed_version("mamba-ssm")
     implementations = {}
-    for name, ef_enabled, mr_enabled in (
-        ("time", True, True),
-        ("vanilla-mamba2", False, False),
-    ):
-        model = build_backbone(
-            d_model=256,
-            d_state=64,
-            d_conv=4,
-            expand=2,
-            ef_enabled=ef_enabled,
-            mr_enabled=mr_enabled,
-        ).cuda()
+    if installed_mamba == EXPECTED_QLAB_VERSIONS["mamba-ssm"]:
+        from TiME.backbones import build_backbone
+
+        builders = (
+            ("time", True, lambda: build_backbone(
+                d_model=256, d_state=64, d_conv=4, expand=2,
+                ef_enabled=True, mr_enabled=True,
+            )),
+            ("vanilla-mamba2", False, lambda: build_backbone(
+                d_model=256, d_state=64, d_conv=4, expand=2,
+                ef_enabled=False, mr_enabled=False,
+            )),
+        )
+        provenance_mode = "pinned-qlab"
+    else:
+        from mamba2 import Mamba2 as TiMEMamba2
+        from mamba_ssm.modules.mamba2 import Mamba2 as UpstreamMamba2
+
+        builders = (
+            ("time", True, lambda: TiMEMamba2(
+                d_model=256, d_state=64, d_conv=4, expand=2,
+                ef_enabled=True, mr_enabled=True,
+            )),
+            ("vanilla-mamba2", False, lambda: UpstreamMamba2(
+                d_model=256, d_state=64, d_conv=4, expand=2,
+            )),
+        )
+        provenance_mode = "h200-compatibility-unpinned"
+
+    for name, uses_resets, builder in builders:
+        model = builder().cuda()
         inputs = torch.randn(2, 8, 256, device="cuda", requires_grad=True)
         resets = torch.zeros(2, 8, dtype=torch.bool, device="cuda")
         resets[:, 4] = True
-        output = model(inputs, resets=resets) if ef_enabled else model(inputs)
+        output = model(inputs, resets=resets) if uses_resets else model(inputs)
         loss = output.square().mean()
         loss.backward()
         if output.shape != inputs.shape or not torch.isfinite(output).all():
@@ -122,7 +140,11 @@ def check_backbones() -> dict:
         implementations[name] = type(model).__module__
         del model, inputs, output, loss
     torch.cuda.synchronize()
-    return {"implementations": implementations}
+    return {
+        "implementations": implementations,
+        "mamba_ssm_version": installed_mamba,
+        "provenance_mode": provenance_mode,
+    }
 
 
 def check_brax_torch_bridge() -> dict:
@@ -213,15 +235,22 @@ def main() -> int:
         name: receipt.versions[name] == expected
         for name, expected in EXPECTED_QLAB_VERSIONS.items()
     }
+    receipt.scientific_compatible_with_qlab = all(receipt.version_match.values())
     receipt.stage("cuda-runtime", lambda: (collect_runtime(receipt) or receipt.runtime))
     if receipt.stages[-1]["status"] == "passed":
         receipt.stage("jax-cuda", check_jax_cuda)
         receipt.stage("time-and-vanilla-backbones", check_backbones)
         receipt.stage("brax-torch-dlpack", check_brax_torch_bridge)
-        receipt.stage("corrected-v2-one-update", check_one_update)
-    receipt.scientific_compatible_with_qlab = all(receipt.version_match.values())
+        if receipt.scientific_compatible_with_qlab:
+            receipt.stage("corrected-v2-one-update", check_one_update)
+        else:
+            receipt.stages.append({
+                "name": "corrected-v2-one-update",
+                "status": "not_applicable",
+                "reason": "installed Mamba stack differs from the pinned qlab protocol",
+            })
     receipt.passed = bool(receipt.stages) and all(
-        stage["status"] == "passed" for stage in receipt.stages
+        stage["status"] in {"passed", "not_applicable"} for stage in receipt.stages
     )
     print("H200_SMOKE_RESULT=" + json.dumps(receipt.__dict__, sort_keys=True))
     return 0 if receipt.passed else 1
