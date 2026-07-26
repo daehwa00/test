@@ -56,8 +56,8 @@ class H200CampaignTest(unittest.TestCase):
             self.assertEqual(MODULE.execute_campaign(args), 0)
         self.assertEqual(write_manifest.call_args.args[1]["run_count"], 80)
         selected = tuple(execute.call_args.args[1])
-        self.assertEqual(len(selected), 20)
-        self.assertEqual({run.task for run in selected}, {"ant", "walker2d"})
+        self.assertEqual(len(selected), 10)
+        self.assertEqual({run.task for run in selected}, {"hopper"})
         self.assertEqual(execute.call_args.kwargs["device"], "cuda")
         self.assertFalse(execute.call_args.kwargs["use_wandb"])
         self.assertTrue(execute.call_args.kwargs["resume"])
@@ -72,7 +72,7 @@ class H200CampaignTest(unittest.TestCase):
             batch: {run.run_id for run in MODULE.batch_runs(batch)}
             for batch in MODULE.BATCH_TASKS
         }
-        self.assertTrue(all(len(ids) == 20 for ids in run_ids.values()))
+        self.assertTrue(all(len(ids) == 10 for ids in run_ids.values()))
         for left, left_ids in run_ids.items():
             for right, right_ids in run_ids.items():
                 if left != right:
@@ -116,8 +116,8 @@ class H200CampaignTest(unittest.TestCase):
             )
         encoded = json.dumps(receipt)
         self.assertTrue(receipt["passed"])
-        self.assertEqual(receipt["status"]["completed"], 20)
-        self.assertEqual(len(receipt["runs"]), 20)
+        self.assertEqual(receipt["status"]["completed"], 10)
+        self.assertEqual(len(receipt["runs"]), 10)
         self.assertLess(len(encoded), 25_000)
         self.assertNotIn("run_id", encoded)
         self.assertNotIn("history", encoded)

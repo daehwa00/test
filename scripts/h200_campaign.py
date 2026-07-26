@@ -1,4 +1,4 @@
-"""Execute recoverable 20-run batches of the canonical H200 primary matrix."""
+"""Execute recoverable 10-run task batches of the canonical H200 primary matrix."""
 
 from __future__ import annotations
 
@@ -36,10 +36,14 @@ def install_signal_handlers() -> None:
 CAMPAIGN_NAME = "standard-primary"  # Compatibility name for the canonical campaign.
 DEFAULT_OUTPUT_DIR = Path("results/h200-standard-primary")
 BATCH_TASKS = {
-    "batch-1": ("halfcheetah", "hopper"),
-    "batch-2": ("ant", "walker2d"),
-    "batch-3": ("swimmer", "reacher"),
-    "batch-4": ("pusher", "humanoidstandup"),
+    "batch-1": ("halfcheetah",),
+    "batch-2": ("hopper",),
+    "batch-3": ("ant",),
+    "batch-4": ("walker2d",),
+    "batch-5": ("swimmer",),
+    "batch-6": ("reacher",),
+    "batch-7": ("pusher",),
+    "batch-8": ("humanoidstandup",),
 }
 
 
@@ -57,8 +61,8 @@ def batch_runs(batch: str, reset_dt: float = 5.0) -> tuple[Any, ...]:
     if batch not in BATCH_TASKS:
         raise ValueError(f"unknown H200 batch: {batch}")
     runs = tuple(run for run in build_matrix(reset_dt) if run.task in BATCH_TASKS[batch])
-    if len(runs) != 20:
-        raise RuntimeError(f"{batch} must contain exactly 20 canonical primary runs")
+    if len(runs) != 10:
+        raise RuntimeError(f"{batch} must contain exactly 10 canonical primary runs")
     return runs
 
 
