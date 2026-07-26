@@ -1,4 +1,4 @@
-"""Execute and compactly report the canonical corrected-v2 H200 primary matrix."""
+"""Execute recoverable 20-run batches of the canonical H200 primary matrix."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import signal
 import subprocess
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +14,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from aggregate_results import aggregate
-from artifacts import read_json, run_status_path
-from experiment_config import EXECUTION_DEVICE, PRIMARY_VARIANTS, TASKS, TRAINING_SEEDS
-from run_brax_matrix import execute_matrix, matrix_manifest
+from artifacts import read_json, run_history_path, write_matrix_manifest
+from experiment_config import EXECUTION_DEVICE, PRIMARY_VARIANTS, TASKS, TRAINING_SEEDS, build_matrix
+from metrics import summarize_history
+from run_brax_matrix import execute_run_configs, matrix_manifest
+
 
 class CampaignInterrupted(BaseException):
     """Stop the matrix without being swallowed by per-run Exception handling."""
@@ -33,150 +33,114 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _interrupt)
 
 
-CAMPAIGN_NAME = "standard-primary"
+CAMPAIGN_NAME = "standard-primary"  # Compatibility name for the canonical campaign.
 DEFAULT_OUTPUT_DIR = Path("results/h200-standard-primary")
+BATCH_TASKS = {
+    "batch-1": ("halfcheetah", "hopper"),
+    "batch-2": ("ant", "walker2d"),
+    "batch-3": ("swimmer", "reacher"),
+    "batch-4": ("pusher", "humanoidstandup"),
+}
 
 
 def canonical_primary_manifest(reset_dt: float = 5.0) -> dict[str, Any]:
-    """Return the sole H200 campaign definition, rejecting matrix drift early."""
     manifest = matrix_manifest(reset_dt)
     expected_count = len(TASKS) * len(PRIMARY_VARIANTS) * len(TRAINING_SEEDS)
-    if (
-        manifest["run_count"] != expected_count
-        or {variant["name"] for variant in manifest["variants"]}
-        != {"time", "vanilla-mamba2"}
-    ):
+    if (manifest["run_count"] != expected_count or
+            {variant["name"] for variant in manifest["variants"]} != {"time", "vanilla-mamba2"}):
         raise RuntimeError("canonical corrected-v2 primary matrix is not the expected 80 runs")
     return manifest
 
 
-def campaign_command(interpreter: Path, output_dir: Path) -> tuple[str, ...]:
-    return (
-        str(interpreter),
-        str(Path(__file__).resolve()),
-        "--output-dir",
-        str(output_dir),
-        "--authorize-full-execution",
-    )
+def batch_runs(batch: str, reset_dt: float = 5.0) -> tuple[Any, ...]:
+    """Return the explicit canonical RunConfigs authorized for one H200 request."""
+    if batch not in BATCH_TASKS:
+        raise ValueError(f"unknown H200 batch: {batch}")
+    runs = tuple(run for run in build_matrix(reset_dt) if run.task in BATCH_TASKS[batch])
+    if len(runs) != 20:
+        raise RuntimeError(f"{batch} must contain exactly 20 canonical primary runs")
+    return runs
+
+
+def campaign_command(interpreter: Path, output_dir: Path, batch: str = "batch-1") -> tuple[str, ...]:
+    return (str(interpreter), str(Path(__file__).resolve()), "--output-dir", str(output_dir),
+            "--batch", batch, "--authorize-full-execution")
 
 
 def source_commit() -> str | None:
     try:
-        result = subprocess.run(
-            ("git", "rev-parse", "HEAD"), cwd=PROJECT_ROOT, check=False,
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
-        )
+        result = subprocess.run(("git", "rev-parse", "HEAD"), cwd=PROJECT_ROOT, check=False,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     commit = result.stdout.strip()
     return commit if result.returncode == 0 and commit else None
 
 
-def _mean(values: list[float]) -> float | None:
-    return sum(values) / len(values) if values else None
+def _compact_delta_drift(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    telemetry = [event for event in events if event.get("event") == "delta_telemetry"]
+    if not telemetry:
+        return []
+    from TiME.delta_telemetry import summarize_delta_drift
+    summary = summarize_delta_drift(telemetry)
+    fields = ("delta_mean_change", "timescale_median_change", "effective_projection_norm_change")
+    return [{"layer_index": layer.get("layer_index"),
+             **{field: layer.get(field) for field in fields}}
+            for layer in summary.get("layers", []) if isinstance(layer, dict)]
 
 
-def _compact_delta_drift(delta_by_seed: dict[str, Any]) -> list[dict[str, Any]]:
-    """Collapse per-seed, per-layer drift into receipt-safe condition summaries."""
-    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for drift in delta_by_seed.values():
-        if not isinstance(drift, dict):
-            continue
-        for layer in drift.get("layers", []):
-            if isinstance(layer, dict) and isinstance(layer.get("layer_index"), int):
-                grouped[layer["layer_index"]].append(layer)
-    fields = (
-        "delta_mean_change",
-        "timescale_median_change",
-        "effective_projection_norm_change",
-    )
-    return [
-        {
-            "layer_index": index,
-            "n_seeds": len(layers),
-            **{
-                field: _mean([float(layer[field]) for layer in layers if isinstance(layer.get(field), (int, float))])
-                for field in fields
-            },
-        }
-        for index, layers in sorted(grouped.items())
-    ]
+def run_evidence(output_dir: Path, run: Any, status: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Read a completed run's compact, per-seed recovery evidence."""
+    if not status or status.get("state") != "completed":
+        return None
+    try:
+        attempt_id = status["attempt_id"]
+        events = [event for event in read_json(run_history_path(output_dir, run.run_id)).get("events", [])
+                  if event.get("attempt_id") == attempt_id]
+        initialization = [event for event in events
+                          if event.get("event") == "shared_initialization_verified"]
+        digest = initialization[0].get("shared_initialization_digest") if len(initialization) == 1 else None
+        valid = (isinstance(digest, str) and len(digest) == 64 and
+                 all(character in "0123456789abcdef" for character in digest) and
+                 bool(initialization[0].get("backbone_provenance")) if len(initialization) == 1 else False)
+        metrics = summarize_history(events)
+        return {"task": run.task, "variant": run.variant.name, "seed": run.seed,
+                "final_return": metrics["final_return"], "auc": metrics["auc"],
+                "delta_drift": _compact_delta_drift(events),
+                "shared_initialization_digest": digest, "provenance_valid": valid}
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
 
 
-def compact_receipt(
-    manifest: dict[str, Any], aggregate_result: dict[str, Any] | None,
-    output_dir: Path, execution_error: str | None, aggregation_error: str | None,
-) -> dict[str, Any]:
-    """Return a bounded receipt without histories, run IDs, or per-seed telemetry."""
-    completeness = (aggregate_result or {}).get("completeness", {})
-    expected_ids = {str(run["run_id"]) for run in manifest["runs"]}
-    failed = 0
-    for run_id in expected_ids:
-        status_path = run_status_path(output_dir, run_id)
-        if status_path.exists():
-            try:
-                failed += read_json(status_path).get("state") == "failed"
-            except (OSError, ValueError, TypeError):
-                pass
-    conditions = []
-    for condition in (aggregate_result or {}).get("conditions", []):
-        conditions.append({
-            "task": condition["task"],
-            "variant": condition["variant"],
-            "final_return": condition["final_return"],
-            "auc": condition["auc"],
-            "delta_drift": _compact_delta_drift(condition.get("delta_drift_by_seed", {})),
-        })
-    paired = [
-        {
-            "task": value["task"],
-            "contrast": value["contrast"],
-            "final_return": value["final_return"],
-            "auc": value["auc"],
-        }
-        for value in (aggregate_result or {}).get("paired_differences", [])
-    ]
-    completed = int(completeness.get("completed_runs", 0))
-    missing = len(completeness.get("missing_run_ids", expected_ids))
-    invalid = (
-        len(completeness.get("invalid_run_ids", []))
-        + len(completeness.get("invalid_pairs", []))
-        + len(completeness.get("unexpected_run_ids", []))
-    )
-    passed = (
-        execution_error is None and aggregation_error is None
-        and bool(completeness.get("complete")) and failed == 0
-    )
-    return {
-        "passed": passed,
-        "campaign": CAMPAIGN_NAME,
-        "source_commit": source_commit(),
-        "canonical_run_count": manifest["run_count"],
-        "status": {"completed": completed, "missing": missing, "invalid": invalid, "failed": failed},
-        "conditions": conditions,
-        "paired_differences": paired,
-        "errors": {
-            "execution": execution_error,
-            "aggregation": aggregation_error,
-        },
-    }
+def batch_receipt(manifest: dict[str, Any], batch: str, output_dir: Path,
+                  statuses: dict[str, dict[str, Any] | None], execution_error: str | None) -> dict[str, Any]:
+    runs = batch_runs(batch, manifest["reset_dt"])
+    evidence = [value for run in runs
+                if (value := run_evidence(output_dir, run, statuses.get(run.run_id))) is not None]
+    failed = sum(bool(status and status.get("state") == "failed") for status in statuses.values())
+    completed = len(evidence)
+    missing = len(runs) - completed - failed
+    passed = execution_error is None and completed == len(runs) and failed == 0 and missing == 0 and all(
+        item["final_return"] is not None and item["auc"] is not None and item["provenance_valid"] for item in evidence)
+    return {"passed": passed, "campaign": CAMPAIGN_NAME, "batch": batch,
+            "source_commit": source_commit(), "canonical_run_count": manifest["run_count"],
+            "status": {"expected": len(runs), "completed": completed, "failed": failed, "missing": missing},
+            "runs": evidence, "errors": {"execution": execution_error}}
 
 
-def execute_campaign(args: argparse.Namespace) -> int:
+def execute_campaign(args: argparse.Namespace, on_terminal: Any = None) -> int:
     manifest = canonical_primary_manifest(args.reset_dt)
     if not args.authorize_full_execution:
         raise RuntimeError("Full execution requires --authorize-full-execution")
-    matrix_args = argparse.Namespace(
-        output_dir=str(args.output_dir), reset_dt=args.reset_dt, device=EXECUTION_DEVICE,
-        use_wandb=False, execute=True, authorize_full_execution=True, resume=args.resume,
-    )
-    execute_matrix(matrix_args)
-    return 0
+    write_matrix_manifest(args.output_dir, manifest)  # Full manifest is required by aggregators.
+    return execute_run_configs(args.output_dir, batch_runs(args.batch, args.reset_dt), device=EXECUTION_DEVICE,
+                               use_wandb=False, resume=args.resume, on_terminal=on_terminal)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--batch", choices=tuple(BATCH_TASKS), required=True)
     parser.set_defaults(reset_dt=5.0)
     parser.add_argument("--authorize-full-execution", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -187,20 +151,21 @@ def main() -> int:
     args = build_parser().parse_args()
     manifest = canonical_primary_manifest(args.reset_dt)
     install_signal_handlers()
+    statuses: dict[str, dict[str, Any] | None] = {}
+
+    def checkpoint(run: Any, status: dict[str, Any] | None) -> None:
+        statuses[run.run_id] = status
+        receipt = batch_receipt(manifest, args.batch, args.output_dir, statuses, None)
+        print("H200_BATCH_CHECKPOINT=" + json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+
     execution_error = None
-    aggregation_error = None
-    aggregate_result = None
     try:
-        execute_campaign(args)
+        failed = execute_campaign(args, checkpoint)
+        if failed:
+            execution_error = f"RuntimeError: {failed} batch runs failed"
     except BaseException as error:
         execution_error = f"{type(error).__name__}: {error}"
-    try:
-        aggregate_result = aggregate(args.output_dir)
-    except Exception as error:
-        aggregation_error = f"{type(error).__name__}: {error}"
-    receipt = compact_receipt(
-        manifest, aggregate_result, args.output_dir, execution_error, aggregation_error
-    )
+    receipt = batch_receipt(manifest, args.batch, args.output_dir, statuses, execution_error)
     print("H200_CAMPAIGN_RESULT=" + json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     return 0 if receipt["passed"] else 1
 

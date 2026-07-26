@@ -26,15 +26,21 @@ PYTORCH_CU124_INDEX = "https://download.pytorch.org/whl/cu124"
 VIRTUALENV_VERSION = "20.31.2"
 CAMPAIGN_TIMEOUT_SECONDS = 12 * 60 * 60
 STANDARD_PRIMARY_CAMPAIGN = "standard-primary"
+BATCH_CAMPAIGNS = ("batch-1", "batch-2", "batch-3", "batch-4")
+TAIL_LINES = 40
+TAIL_CHARS = 512
+BOOTSTRAP_REPORT_LIMIT = 25_000
 
 
-def campaign_command(interpreter: Path, output_dir: Path) -> tuple[str, ...]:
-    """Build the only authorized H200 campaign invocation."""
+def campaign_command(interpreter: Path, output_dir: Path, batch: str) -> tuple[str, ...]:
+    """Build an explicitly authorized H200 batch invocation."""
     return (
         str(interpreter),
         str(Path(__file__).with_name("h200_campaign.py")),
         "--output-dir",
         str(output_dir),
+        "--batch",
+        batch,
         "--authorize-full-execution",
     )
 
@@ -108,15 +114,66 @@ def venv_interpreter(venv: Path) -> Path:
     return venv / "bin" / "python"
 
 
+def _text(value: str | bytes | None) -> str:
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+
+
+def _tail(value: str | bytes | None) -> list[str]:
+    return [line[-TAIL_CHARS:] for line in _text(value).splitlines()[-TAIL_LINES:]]
+
+
+def _checkpoint(value: str | bytes | None) -> str | None:
+    checkpoints = [line[len("H200_BATCH_CHECKPOINT="):] for line in _text(value).splitlines()
+                   if line.startswith("H200_BATCH_CHECKPOINT=")]
+    return checkpoints[-1] if checkpoints else None
+
+
 def run_bounded(command: tuple[str, ...], timeout: int, *, env: dict[str, str] | None = None) -> dict[str, Any]:
     try:
         completed = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as exc:
-        return {"command": list(command), "returncode": None, "stdout_tail": (exc.stdout or "").splitlines()[-40:],
-                "stderr_tail": (exc.stderr or "").splitlines()[-40:], "timed_out": True}
-    return {"command": list(command), "returncode": completed.returncode,
-            "stdout_tail": completed.stdout.splitlines()[-40:], "stderr_tail": completed.stderr.splitlines()[-40:]}
+        stdout, stderr, returncode, timed_out = exc.stdout, exc.stderr, None, True
+    else:
+        stdout, stderr, returncode, timed_out = completed.stdout, completed.stderr, completed.returncode, False
+    result = {"command": list(command), "returncode": returncode, "stdout_tail": _tail(stdout),
+              "stderr_tail": _tail(stderr), "timed_out": timed_out}
+    checkpoint = _checkpoint(stdout)
+    if checkpoint is not None:
+        result["latest_batch_checkpoint"] = checkpoint
+    return result
+
+
+def _compact_command_result(value: dict[str, Any]) -> dict[str, Any]:
+    compact = {key: value[key] for key in ("stage", "status", "returncode", "timed_out",
+                                           "latest_batch_checkpoint") if key in value}
+    if "command" in value:
+        compact["command"] = [str(argument)[-128:] for argument in value["command"][-16:]]
+    for key in ("stdout_tail", "stderr_tail"):
+        if value.get(key):
+            compact[key] = [str(line)[-128:] for line in value[key][-2:]]
+    for key in ("versions", "venv"):
+        if key in value:
+            compact[key] = value[key]
+    return compact
+
+
+def compact_bootstrap_result(result: dict[str, Any]) -> dict[str, Any]:
+    compact = {key: value for key, value in result.items() if key not in {"audit", "smoke"}}
+    compact["audit"] = [_compact_command_result(item) for item in result.get("audit", [])]
+    if "smoke" in result:
+        compact["smoke"] = _compact_command_result(result["smoke"])
+    campaign = compact.get("campaign")
+    if isinstance(campaign, dict) and isinstance(campaign.get("result"), dict):
+        compact["campaign"] = {**campaign, "result": _compact_command_result(campaign["result"])}
+    return compact
+
+
+def print_result(result: dict[str, Any]) -> None:
+    encoded = json.dumps(compact_bootstrap_result(result), sort_keys=True, separators=(",", ":"))
+    if len(encoded) >= BOOTSTRAP_REPORT_LIMIT:
+        raise RuntimeError("compacted H200 bootstrap result exceeds FaaS report cap")
+    print("H200_BOOTSTRAP_RESULT=" + encoded)
 
 
 def installation_commands(interpreter: Path, pip_cache: Path) -> tuple[tuple[str, ...], ...]:
@@ -261,7 +318,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-root", type=Path, default=CACHE_ROOT)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--campaign", choices=(STANDARD_PRIMARY_CAMPAIGN,))
+    parser.add_argument("--campaign", choices=BATCH_CAMPAIGNS)
     parser.add_argument("--authorize-full-execution", action="store_true")
     parser.add_argument(
         "--campaign-output-dir", type=Path,
@@ -278,21 +335,21 @@ def main() -> int:
         "audit": audit,
     }
     if args.campaign:
-        command = campaign_command(interpreter, args.campaign_output_dir)
-        result["campaign"] = {"name": args.campaign, "command": list(command)}
+        command = campaign_command(interpreter, args.campaign_output_dir, args.campaign)
+        result["campaign"] = {"name": STANDARD_PRIMARY_CAMPAIGN, "batch": args.campaign, "command": list(command)}
     if reason:
         result["reason"] = reason
-        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+        print_result(result)
         return 1
     if args.dry_run:
         if args.campaign:
             result["campaign"]["status"] = "would-run"
         result["passed"] = True
-        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+        print_result(result)
         return 0
     if args.campaign and not args.authorize_full_execution:
         result["reason"] = "campaign-requires-authorize-full-execution"
-        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+        print_result(result)
         return 1
     smoke = run_bounded(
         (str(interpreter), str(Path(__file__).with_name("h200_smoke.py")),
@@ -302,7 +359,7 @@ def main() -> int:
     result["smoke"] = smoke
     if smoke["returncode"] != 0:
         result["passed"] = False
-        print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+        print_result(result)
         return 1
     if args.campaign:
         campaign = run_bounded(command, timeout=CAMPAIGN_TIMEOUT_SECONDS)
@@ -310,7 +367,7 @@ def main() -> int:
         result["passed"] = campaign["returncode"] == 0
     else:
         result["passed"] = True
-    print("H200_BOOTSTRAP_RESULT=" + json.dumps(result, sort_keys=True))
+    print_result(result)
     return 0 if result["passed"] else 1
 
 

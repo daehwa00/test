@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -120,7 +121,7 @@ class H200BootstrapTest(unittest.TestCase):
         venv = Path("/cache/venvs/time-h200-qlab-test")
         with patch.object(MODULE, "ensure_runtime", return_value=(venv, "test", [], None)), \
              patch.object(MODULE, "run_bounded") as run, \
-             patch.object(sys, "argv", ["h200_bootstrap.py", "--campaign", "standard-primary"]):
+             patch.object(sys, "argv", ["h200_bootstrap.py", "--campaign", "batch-1"]):
             self.assertEqual(MODULE.main(), 1)
         run.assert_not_called()
 
@@ -130,7 +131,7 @@ class H200BootstrapTest(unittest.TestCase):
         with patch.object(MODULE, "ensure_runtime", return_value=(venv, "test", [], None)), \
              patch.object(MODULE, "run_bounded", side_effect=[passed, passed]) as run, \
              patch.object(sys, "argv", [
-                 "h200_bootstrap.py", "--campaign", "standard-primary",
+                 "h200_bootstrap.py", "--campaign", "batch-1",
                  "--authorize-full-execution",
              ]):
             self.assertEqual(MODULE.main(), 0)
@@ -145,7 +146,7 @@ class H200BootstrapTest(unittest.TestCase):
         with patch.object(MODULE, "ensure_runtime", return_value=(venv, "test", [], None)), \
              patch.object(MODULE, "run_bounded") as run, \
              patch.object(sys, "argv", [
-                 "h200_bootstrap.py", "--dry-run", "--campaign", "standard-primary",
+                 "h200_bootstrap.py", "--dry-run", "--campaign", "batch-1",
              ]), \
              patch("builtins.print") as printed:
             self.assertEqual(MODULE.main(), 0)
@@ -153,6 +154,52 @@ class H200BootstrapTest(unittest.TestCase):
         receipt = json.loads(printed.call_args.args[0].split("=", 1)[1])
         self.assertEqual(receipt["campaign"]["status"], "would-run")
         self.assertIn("h200_campaign.py", receipt["campaign"]["command"][1])
+
+    def test_timeout_bytes_are_json_safe_and_keep_latest_checkpoint(self):
+        stdout = b'H200_BATCH_CHECKPOINT={"completed":1}\n' + b"later\n" * 100
+        expired = subprocess.TimeoutExpired(
+            ("child",),
+            1,
+            output=stdout,
+            stderr=b"bad\xff",
+        )
+        with patch.object(MODULE.subprocess, "run", side_effect=expired):
+            result = MODULE.run_bounded(("child",), 1)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["latest_batch_checkpoint"], '{"completed":1}')
+        self.assertIsInstance(result["stderr_tail"][0], str)
+        json.dumps(result)
+
+    def test_compacted_bootstrap_report_stays_below_faas_cap(self):
+        noisy = {
+            "stage": "install",
+            "command": ["x" * 10_000],
+            "returncode": 1,
+            "timed_out": True,
+            "stdout_tail": ["a" * 10_000] * 100,
+            "stderr_tail": ["error" * 10_000] * 100,
+            "latest_batch_checkpoint": "{}",
+        }
+        result = MODULE.compact_bootstrap_result({
+            "audit": [noisy] * 20,
+            "smoke": noisy,
+            "campaign": {"result": noisy},
+        })
+        self.assertLess(
+            len(json.dumps(result, separators=(",", ":"))),
+            MODULE.BOOTSTRAP_REPORT_LIMIT,
+        )
+        self.assertTrue(result["audit"][0]["timed_out"])
+
+    def test_batch_command_and_timeout_are_explicit(self):
+        command = MODULE.campaign_command(
+            Path("/venv/python"),
+            Path("out"),
+            "batch-3",
+        )
+        self.assertIn("--batch", command)
+        self.assertIn("batch-3", command)
+        self.assertEqual(MODULE.CAMPAIGN_TIMEOUT_SECONDS, 12 * 60 * 60)
 
 
 if __name__ == "__main__":

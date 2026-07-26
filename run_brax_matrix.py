@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from artifacts import (
     BufferedHistoryRecorder,
@@ -26,6 +26,7 @@ from experiment_config import (
     TASKS,
     TRAINING_SEEDS,
     VARIANTS,
+    RunConfig,
     build_matrix,
     expected_evaluation_plan,
     expected_delta_telemetry_steps,
@@ -227,6 +228,22 @@ def _run_one(output_dir: Path, run, device: str, use_wandb: bool, resume: bool) 
     return False
 
 
+def execute_run_configs(
+    output_dir: Path, runs: Iterable[RunConfig], *, device: str, use_wandb: bool,
+    resume: bool, on_terminal: Callable[[RunConfig, dict[str, Any] | None], None] | None = None,
+) -> int:
+    """Execute explicit canonical runs sequentially and report every terminal state."""
+    failed = 0
+    for run in runs:
+        try:
+            failed += _run_one(output_dir, run, device, use_wandb, resume)
+        finally:
+            status = read_status(output_dir, run.run_id)
+            if on_terminal is not None and status and status.get("state") in {"completed", "failed"}:
+                on_terminal(run, status)
+    return failed
+
+
 def execute_matrix(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     manifest = matrix_manifest(args.reset_dt)
@@ -237,9 +254,10 @@ def execute_matrix(args: argparse.Namespace) -> int:
     if not args.authorize_full_execution:
         raise RuntimeError("Full execution requires --authorize-full-execution")
 
-    failed = 0
-    for run in build_matrix(args.reset_dt):
-        failed += _run_one(output_dir, run, args.device, args.use_wandb, args.resume)
+    failed = execute_run_configs(
+        output_dir, build_matrix(args.reset_dt), device=args.device,
+        use_wandb=args.use_wandb, resume=args.resume,
+    )
     if failed:
         raise RuntimeError(f"{failed} corrected-v2 runs failed; inspect per-run status.json artifacts")
     return 0
